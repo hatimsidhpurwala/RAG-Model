@@ -132,63 +132,6 @@ def scrape(url: str):
     return texts, page_title
 
 
-# ── IMPROVED CLEANING ──────────────────────────────────────────────────────────
-STOP_PHRASES = {
-    "cookie", "privacy policy", "terms of service", "terms & conditions",
-    "login", "sign up", "sign in", "register", "subscribe", "newsletter",
-    "all rights reserved", "click here", "read more", "learn more",
-    "contact us", "follow us", "©", "copyright", "powered by",
-    "javascript", "enable javascript", "menu", "home", "back to top"
-}
-
-def clean(texts):
-    cleaned, seen = [], set()
-    for t in texts:
-        # Normalize whitespace and encoding
-        t = re.sub(r"\s+", " ", t).strip()
-        t = re.sub(r"[^\x00-\x7F]+", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-
-        # Drop very short strings
-        if len(t) < 40:
-            continue
-
-        low = t.lower()
-
-        # Drop noise phrases
-        if any(ph in low for ph in STOP_PHRASES):
-            continue
-
-        # Drop strings that are mostly special characters / numbers
-        alpha_ratio = sum(c.isalpha() for c in t) / len(t)
-        if alpha_ratio < 0.5:
-            continue
-
-        # Deduplication using 100-char fingerprint
-        key = re.sub(r"\W+", "", low)[:100]
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(t)
-    return cleaned
-
-
-# ── CHUNKING ───────────────────────────────────────────────────────────────────
-def chunk(texts, max_words=150, overlap=30):
-    chunks = []
-    for t in texts:
-        words = t.split()
-        if len(words) <= max_words:
-            if len(words) >= 8:   # skip micro-fragments
-                chunks.append(t)
-        else:
-            for i in range(0, len(words), max_words - overlap):
-                chunk_words = words[i: i + max_words]
-                if len(chunk_words) >= 15:
-                    chunks.append(" ".join(chunk_words))
-    return chunks
-
-
 # ── EMBEDDING + FAISS ──────────────────────────────────────────────────────────
 def build_index(chunks, model):
     embeddings = model.encode(chunks, show_progress_bar=False, batch_size=32)
