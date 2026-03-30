@@ -16,29 +16,27 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-.step-done   { color: #22c55e; font-weight: 500; }
-.step-active { color: #f59e0b; font-weight: 500; }
-.step-wait   { color: #6b7280; }
-.answer-box  {
-    background: #f0f9ff;
-    border-left: 4px solid #3b82f6;
-    border-radius: 6px;
-    padding: 16px 20px;
+.answer-box {
+    background: #1a1a2e;
+    border-left: 4px solid #7c6ef7;
+    border-radius: 8px;
+    padding: 20px 24px;
     margin-top: 12px;
     font-size: 15px;
-    line-height: 1.7;
+    line-height: 1.9;
+    color: #e8e6f0;
 }
-.metric-row  { display: flex; gap: 12px; margin: 12px 0; }
-.metric-card {
-    flex: 1;
-    background: #f8fafc;
-    border: 1px solid #e2e8f0;
+.step-card {
+    background: #16213e;
+    border: 1px solid #2a2a4a;
     border-radius: 8px;
     padding: 12px 16px;
-    text-align: center;
+    margin: 6px 0;
+    font-size: 14px;
 }
-.metric-val  { font-size: 22px; font-weight: 700; color: #1e293b; }
-.metric-lbl  { font-size: 12px; color: #64748b; margin-top: 2px; }
+.step-done   { color: #22c55e; }
+.step-active { color: #f59e0b; }
+.step-wait   { color: #4a4a6a; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -51,50 +49,123 @@ if "ready" not in st.session_state:
     st.session_state.ready = False
 
 
-# ── Model loaders (cached) ─────────────────────────────────────────────────────
+# ── Cached model loaders ───────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_embed_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 @st.cache_resource(show_spinner=False)
 def load_llm():
-    tok   = T5Tokenizer.from_pretrained("google/flan-t5-base")
-    model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-base")
+    tok   = T5Tokenizer.from_pretrained("google/flan-t5-large")
+    model = T5ForConditionalGeneration.from_pretrained("google/flan-t5-large")
     return model, tok
 
 
-# ── Scraping ───────────────────────────────────────────────────────────────────
+# ── IMPROVED SCRAPING ──────────────────────────────────────────────────────────
 def scrape(url: str):
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; RAGBot/1.0)"}
-    r = requests.get(url, headers=headers, timeout=20)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    r = requests.get(url, headers=headers, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "form"]):
+
+    # Remove all non-content tags
+    for tag in soup(["script", "style", "nav", "footer", "header",
+                     "noscript", "form", "iframe", "button", "input",
+                     "aside", "meta", "link"]):
         tag.decompose()
+
     texts = []
-    for tag in soup.find_all(["h1","h2","h3","h4","p","li","td","th","blockquote","article"]):
-        t = tag.get_text(separator=" ", strip=True)
+
+    # ── Strategy 1: grab structured semantic blocks ──
+    # Join list items under their parent so "We supply and support: item1 item2"
+    # becomes one coherent chunk instead of orphaned fragments
+    for ul in soup.find_all(["ul", "ol"]):
+        # find nearest preceding heading or paragraph as context
+        prev = ul.find_previous(["h1","h2","h3","h4","p"])
+        context = prev.get_text(" ", strip=True) if prev else ""
+        items = [li.get_text(" ", strip=True) for li in ul.find_all("li") if li.get_text(strip=True)]
+        if items:
+            joined = (context + " " if context else "") + " | ".join(items)
+            texts.append(joined)
+
+    # ── Strategy 2: grab headings + next sibling paragraphs together ──
+    for heading in soup.find_all(["h1","h2","h3","h4"]):
+        heading_text = heading.get_text(" ", strip=True)
+        siblings = []
+        for sib in heading.find_next_siblings():
+            if sib.name in ["h1","h2","h3","h4"]:
+                break
+            t = sib.get_text(" ", strip=True)
+            if t:
+                siblings.append(t)
+        if heading_text and siblings:
+            block = heading_text + ". " + " ".join(siblings[:4])
+            texts.append(block)
+        elif heading_text:
+            texts.append(heading_text)
+
+    # ── Strategy 3: plain paragraphs ──
+    for p in soup.find_all("p"):
+        t = p.get_text(" ", strip=True)
         if t:
             texts.append(t)
-    return texts, soup.title.string if soup.title else url
+
+    # ── Strategy 4: divs / sections with meaningful text ──
+    for div in soup.find_all(["div", "section", "article", "span"]):
+        # Only direct text, not all descendants (avoids duplication)
+        direct = " ".join(
+            child.strip()
+            for child in div.strings
+            if isinstance(child, str) and child.strip()
+        )
+        if len(direct) > 60:
+            texts.append(direct)
+
+    page_title = soup.title.string.strip() if soup.title and soup.title.string else url
+    return texts, page_title
 
 
-# ── Cleaning ───────────────────────────────────────────────────────────────────
-STOP_PHRASES = {"cookie","privacy policy","terms of service","login","sign up",
-                "subscribe","newsletter","all rights reserved","click here",
-                "read more","learn more","contact us","follow us"}
+# ── IMPROVED CLEANING ──────────────────────────────────────────────────────────
+STOP_PHRASES = {
+    "cookie", "privacy policy", "terms of service", "terms & conditions",
+    "login", "sign up", "sign in", "register", "subscribe", "newsletter",
+    "all rights reserved", "click here", "read more", "learn more",
+    "contact us", "follow us", "©", "copyright", "powered by",
+    "javascript", "enable javascript", "menu", "home", "back to top"
+}
 
 def clean(texts):
     cleaned, seen = [], set()
     for t in texts:
+        # Normalize whitespace and encoding
         t = re.sub(r"\s+", " ", t).strip()
         t = re.sub(r"[^\x00-\x7F]+", " ", t)
-        if len(t) < 20:
+        t = re.sub(r"\s+", " ", t).strip()
+
+        # Drop very short strings
+        if len(t) < 40:
             continue
+
         low = t.lower()
+
+        # Drop noise phrases
         if any(ph in low for ph in STOP_PHRASES):
             continue
-        key = re.sub(r"\W+", "", low)[:80]
+
+        # Drop strings that are mostly special characters / numbers
+        alpha_ratio = sum(c.isalpha() for c in t) / len(t)
+        if alpha_ratio < 0.5:
+            continue
+
+        # Deduplication using 100-char fingerprint
+        key = re.sub(r"\W+", "", low)[:100]
         if key in seen:
             continue
         seen.add(key)
@@ -102,60 +173,113 @@ def clean(texts):
     return cleaned
 
 
-# ── Chunking ───────────────────────────────────────────────────────────────────
-def chunk(texts, max_words=120, overlap=20):
+# ── CHUNKING ───────────────────────────────────────────────────────────────────
+def chunk(texts, max_words=150, overlap=30):
     chunks = []
     for t in texts:
         words = t.split()
         if len(words) <= max_words:
-            chunks.append(t)
+            if len(words) >= 8:   # skip micro-fragments
+                chunks.append(t)
         else:
             for i in range(0, len(words), max_words - overlap):
-                chunk_words = words[i : i + max_words]
+                chunk_words = words[i: i + max_words]
                 if len(chunk_words) >= 15:
                     chunks.append(" ".join(chunk_words))
     return chunks
 
 
-# ── Embedding + FAISS ──────────────────────────────────────────────────────────
+# ── EMBEDDING + FAISS ──────────────────────────────────────────────────────────
 def build_index(chunks, model):
     embeddings = model.encode(chunks, show_progress_bar=False, batch_size=32)
     embeddings = np.array(embeddings, dtype="float32")
     faiss.normalize_L2(embeddings)
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
-    return index, embeddings
+    return index
 
 
-# ── Retrieval ──────────────────────────────────────────────────────────────────
-def retrieve(query, index, chunks, model, top_k=5):
+# ── RETRIEVAL ──────────────────────────────────────────────────────────────────
+def retrieve(query, index, chunks, model, top_k=6):
     q_emb = model.encode([query], show_progress_bar=False)
     q_emb = np.array(q_emb, dtype="float32")
     faiss.normalize_L2(q_emb)
     scores, ids = index.search(q_emb, top_k)
-    results = [(chunks[i], float(scores[0][j])) for j, i in enumerate(ids[0]) if i < len(chunks)]
+    results = [
+        (chunks[i], float(scores[0][j]))
+        for j, i in enumerate(ids[0])
+        if i < len(chunks)
+    ]
     return results
 
 
-# ── Answer generation ──────────────────────────────────────────────────────────
-def generate_answer(query, context_chunks, model, tokenizer, max_new_tokens=256):
-    context = " ".join([c for c, _ in context_chunks[:4]])
-    context = context[:1800]
+# ── IMPROVED ANSWER GENERATION ─────────────────────────────────────────────────
+def generate_answer(query, context_chunks, model, tokenizer):
+    # Build rich context from top chunks
+    context_parts = []
+    total_words = 0
+    for chunk_text, score in context_chunks:
+        words = chunk_text.split()
+        if total_words + len(words) > 400:
+            break
+        context_parts.append(chunk_text)
+        total_words += len(words)
+
+    context = " ".join(context_parts)
+
+    # Clear, detailed prompt that forces a full paragraph answer
     prompt = (
-        f"Answer the following question using only the context provided.\n\n"
-        f"Context: {context}\n\n"
+        f"You are a helpful assistant. Based on the information below, "
+        f"write a detailed paragraph answering the question.\n\n"
+        f"Information: {context}\n\n"
         f"Question: {query}\n\n"
-        f"Answer:"
+        f"Write a complete, detailed paragraph answer (at least 3 sentences):\n"
     )
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=700
+    )
+
     outputs = model.generate(
         **inputs,
-        max_new_tokens=max_new_tokens,
-        num_beams=4,
+        max_new_tokens=300,
+        min_new_tokens=60,       # Force at least 60 tokens — prevents empty answers
+        num_beams=5,
         early_stopping=True,
         no_repeat_ngram_size=3,
+        length_penalty=1.5,      # Encourages longer answers
+        temperature=0.7,
+        do_sample=False,
     )
-    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # If model still returns something too short, fall back to a summary from context
+    if len(answer.strip()) < 40:
+        answer = _fallback_answer(query, context_parts)
+
+    return answer
+
+
+def _fallback_answer(query, context_parts):
+    """
+    Simple extractive fallback: stitch the most relevant sentences together
+    into a readable paragraph when the LLM output is too short.
+    """
+    all_sentences = []
+    for part in context_parts:
+        sentences = re.split(r'(?<=[.!?])\s+', part)
+        all_sentences.extend([s.strip() for s in sentences if len(s.strip()) > 30])
+
+    if not all_sentences:
+        return "I could not find a clear answer to your question in the website content."
+
+    # Return up to 5 sentences as a coherent paragraph
+    selected = all_sentences[:5]
+    return " ".join(selected)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,132 +288,130 @@ def generate_answer(query, context_chunks, model, tokenizer, max_new_tokens=256)
 
 st.title("🧠 Universal Web-Based AI System")
 st.caption("Enter any website URL → the system scrapes, cleans, indexes, and lets you query it with AI.")
-
 st.divider()
 
-# ── Section 1: URL input ───────────────────────────────────────────────────────
+# ── STEP 1: URL input ──────────────────────────────────────────────────────────
 st.subheader("Step 1 — Process a website")
 
 col_url, col_btn = st.columns([4, 1])
 with col_url:
-    url = st.text_input("Website URL", placeholder="https://example.com", label_visibility="collapsed")
+    url = st.text_input("Website URL", placeholder="https://example.com",
+                        label_visibility="collapsed")
 with col_btn:
     process_btn = st.button("Process", use_container_width=True, type="primary")
 
-# ── Pipeline progress placeholder ─────────────────────────────────────────────
-progress_placeholder = st.empty()
+progress_box = st.empty()
 
 STEPS = [
-    ("🔍", "Scraping website…",          "Scraping complete"),
-    ("🧹", "Cleaning data…",             "Data cleaned"),
-    ("✂️", "Chunking text…",             "Text chunked"),
-    ("🔢", "Generating embeddings…",     "Embeddings generated"),
-    ("🗄️", "Building vector database…", "Vector DB created"),
-    ("🤖", "Loading LLM…",               "Model ready"),
+    ("Scraping website…",          "Scraping complete"),
+    ("Cleaning & filtering data…", "Data cleaned"),
+    ("Chunking into segments…",    "Text chunked"),
+    ("Generating embeddings…",     "Embeddings generated"),
+    ("Building FAISS vector DB…",  "Vector DB ready"),
+    ("Loading LLM model…",         "Model ready — ask your question!"),
 ]
 
-def render_steps(done_up_to: int, active: int):
-    lines = []
-    for i, (icon, active_label, done_label) in enumerate(STEPS):
-        if i < done_up_to:
-            lines.append(f'<p class="step-done">✅ {done_label}</p>')
+def render_steps(done: int, active: int):
+    html = ""
+    for i, (active_lbl, done_lbl) in enumerate(STEPS):
+        if i < done:
+            html += f'<div class="step-card step-done">✅ {done_lbl}</div>'
         elif i == active:
-            lines.append(f'<p class="step-active">⏳ {icon} {active_label}</p>')
+            html += f'<div class="step-card step-active">⏳ {active_lbl}</div>'
         else:
-            lines.append(f'<p class="step-wait">○ {done_label}</p>')
-    return "\n".join(lines)
+            html += f'<div class="step-card step-wait">○ {done_lbl}</div>'
+    return html
+
 
 if process_btn and url:
     st.session_state.ready = False
     try:
-        with st.spinner(""):
+        progress_box.markdown(render_steps(-1, 0), unsafe_allow_html=True)
 
-            # Step 0 — Scrape
-            progress_placeholder.markdown(render_steps(-1, 0), unsafe_allow_html=True)
-            raw_texts, page_title = scrape(url)
-            time.sleep(0.3)
+        # Step 0 — Scrape
+        raw_texts, page_title = scrape(url)
+        progress_box.markdown(render_steps(1, 1), unsafe_allow_html=True)
 
-            # Step 1 — Clean
-            progress_placeholder.markdown(render_steps(1, 1), unsafe_allow_html=True)
-            cleaned = clean(raw_texts)
-            time.sleep(0.2)
+        # Step 1 — Clean
+        cleaned = clean(raw_texts)
+        if not cleaned:
+            st.error("No usable text found. The site may block scrapers or have no readable content.")
+            st.stop()
+        progress_box.markdown(render_steps(2, 2), unsafe_allow_html=True)
 
-            # Step 2 — Chunk
-            progress_placeholder.markdown(render_steps(2, 2), unsafe_allow_html=True)
-            chunks = chunk(cleaned)
-            time.sleep(0.2)
+        # Step 2 — Chunk
+        chunks = chunk(cleaned)
+        if not chunks:
+            st.error("Could not create text chunks. Try a different URL.")
+            st.stop()
+        progress_box.markdown(render_steps(3, 3), unsafe_allow_html=True)
 
-            if not chunks:
-                st.error("No usable text found on this page. Try a different URL.")
-                st.stop()
+        # Step 3 — Embed
+        embed_model = load_embed_model()
+        index = build_index(chunks, embed_model)
+        progress_box.markdown(render_steps(4, 4), unsafe_allow_html=True)
+        time.sleep(0.3)
 
-            # Step 3 — Embeddings
-            progress_placeholder.markdown(render_steps(3, 3), unsafe_allow_html=True)
-            embed_model = load_embed_model()
-            index, _ = build_index(chunks, embed_model)
+        # Step 4 — FAISS done (covered above)
+        progress_box.markdown(render_steps(5, 5), unsafe_allow_html=True)
 
-            # Step 4 — FAISS done (covered by build_index above)
-            progress_placeholder.markdown(render_steps(4, 4), unsafe_allow_html=True)
-            time.sleep(0.2)
+        # Step 5 — Load LLM
+        llm_model, llm_tok = load_llm()
+        progress_box.markdown(render_steps(6, -1), unsafe_allow_html=True)
 
-            # Step 5 — LLM
-            progress_placeholder.markdown(render_steps(5, 5), unsafe_allow_html=True)
-            llm_model, llm_tok = load_llm()
-
-            # All done
-            progress_placeholder.markdown(render_steps(6, -1), unsafe_allow_html=True)
-
-            # Store in session
-            st.session_state.index       = index
-            st.session_state.chunks      = chunks
-            st.session_state.embed_model = embed_model
-            st.session_state.llm_model   = llm_model
-            st.session_state.llm_tok     = llm_tok
-            st.session_state.ready       = True
-            st.session_state.stats       = {
-                "url":       url,
-                "title":     page_title,
-                "raw":       len(raw_texts),
-                "cleaned":   len(cleaned),
-                "chunks":    len(chunks),
-            }
+        # Save to session
+        st.session_state.index       = index
+        st.session_state.chunks      = chunks
+        st.session_state.embed_model = embed_model
+        st.session_state.llm_model   = llm_model
+        st.session_state.llm_tok     = llm_tok
+        st.session_state.ready       = True
+        st.session_state.stats = {
+            "title":   page_title,
+            "raw":     len(raw_texts),
+            "cleaned": len(cleaned),
+            "chunks":  len(chunks),
+        }
 
     except requests.exceptions.RequestException as e:
-        st.error(f"Could not fetch the URL: {e}")
+        st.error(f"Could not reach the URL: {e}")
     except Exception as e:
         st.error(f"Pipeline error: {e}")
+        raise e
 
 elif process_btn and not url:
     st.warning("Please enter a URL first.")
 
 
-# ── Stats cards ────────────────────────────────────────────────────────────────
+# ── Stats ──────────────────────────────────────────────────────────────────────
 if st.session_state.ready and st.session_state.stats:
     s = st.session_state.stats
     st.success(f"✅ **{s['title']}** is ready to query!")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Raw text blocks", s["raw"])
-    c2.metric("Cleaned blocks",  s["cleaned"])
-    c3.metric("Index chunks",    s["chunks"])
+    c1.metric("Raw text blocks",  s["raw"])
+    c2.metric("Cleaned blocks",   s["cleaned"])
+    c3.metric("Index chunks",     s["chunks"])
 
 st.divider()
 
-# ── Section 2: Query ───────────────────────────────────────────────────────────
+# ── STEP 2: Query ──────────────────────────────────────────────────────────────
 st.subheader("Step 2 — Ask a question")
 
 if not st.session_state.ready:
-    st.info("Process a website above before querying.")
+    st.info("Process a website above first.")
 else:
-    query = st.text_input("Your question", placeholder="What is this website about?")
+    query   = st.text_input("Your question",
+                            placeholder="What services do you provide?")
     ask_btn = st.button("Get Answer", type="primary")
 
     if ask_btn and query:
-        with st.spinner("Searching and generating answer…"):
+        with st.spinner("Searching knowledge base and generating answer…"):
             results = retrieve(
                 query,
                 st.session_state.index,
                 st.session_state.chunks,
                 st.session_state.embed_model,
+                top_k=6,
             )
             answer = generate_answer(
                 query,
@@ -299,16 +421,21 @@ else:
             )
 
         st.markdown("#### Answer")
-        st.markdown(f'<div class="answer-box">{answer}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="answer-box">{answer}</div>',
+                    unsafe_allow_html=True)
 
-        with st.expander("View retrieved context chunks"):
+        # Show source context — collapsed by default, clean display
+        with st.expander("View source context used for this answer"):
             for i, (chunk_text, score) in enumerate(results, 1):
-                st.markdown(f"**Chunk {i}** (similarity: `{score:.3f}`)")
-                st.caption(chunk_text)
+                st.markdown(
+                    f"**Source {i}** &nbsp; similarity score: `{score:.3f}`",
+                    unsafe_allow_html=True
+                )
+                st.write(chunk_text)
                 st.divider()
 
     elif ask_btn and not query:
-        st.warning("Please enter a question.")
+        st.warning("Please type a question first.")
 
 st.divider()
-st.caption("Built with Streamlit · FAISS · SentenceTransformers · Flan-T5 · BeautifulSoup")
+st.caption("Built with Streamlit · FAISS · SentenceTransformers · Flan-T5-Large · BeautifulSoup")
